@@ -1,5 +1,16 @@
 # CityBrainChallenge-starter-kit
 
+## Description
+
+This is a alternative of the formal edition, which you can run on your own machine directly.
+The CBEngine directory contents the Formal env, and file citypb.cpython-37m-x86_64-linux-gnu.so is a compiled lib too.
+This repository works well on my machine. if you don't want your code looks ugly you can also move CBEngine and citypd* to your local python libary path,such as "/usr/local/lib/python3.7/dist-packages" for linux
+
+## Notice
+
+By the way , I just test it on linux platform. So if you run it on windows you may should test it yourself.
+
+
 ### FAQ
 
 1. 
