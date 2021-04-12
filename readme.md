@@ -1,4 +1,4 @@
-# CityBrainChallenge-starter-kit
+# CityBrainChallenge-starter-kit a alternative version which can run on your own machine without docker
 
 ## Description
 
