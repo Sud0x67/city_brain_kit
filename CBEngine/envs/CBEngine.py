@@ -1,9 +1,10 @@
 import gym
 import citypb
 import os
+import gc
 import numpy as np
 class CBEngine(gym.Env):
-    def __init__(self,simulator_cfg_file,thread_num,gym_dict):
+    def __init__(self,simulator_cfg_file,thread_num,gym_dict,metric_period):
         self.simulator_cfg_file = simulator_cfg_file
         # with open(cfg_file,'r') as f:
         #     lines = f.readlines()
@@ -18,6 +19,9 @@ class CBEngine(gym.Env):
         self.eng = citypb.Engine(self.simulator_cfg_file,thread_num)
         self.action_space = gym.spaces.Discrete(9)
         self.num_per_action = 10
+        self.vehicles = {}
+        self.metric_period = metric_period
+
         # CFG FILE MUST HAVE SPACE
         with open(self.simulator_cfg_file, 'r') as f:
             lines = f.readlines()
@@ -43,6 +47,8 @@ class CBEngine(gym.Env):
         self.lane_vehicle_state = {}
         self.log_enable = 1
         self.warning_enable = 1
+        self.ui_enable = 1
+        self.info_enable = 1
         with open(self.roadnet_file,'r') as f:
             lines = f.readlines()
             cnt = 0
@@ -146,6 +152,12 @@ class CBEngine(gym.Env):
     def set_warning(self,flg):
         self.warning_enable = flg
 
+    def set_ui(self,flg):
+        self.ui_enable = flg
+
+    def set_info(self,flg):
+        self.info_enable = flg
+
     def step(self, action):
         # here action is a dict {agent_id:phase}
         for agent_id,phase in action.items():
@@ -155,21 +167,58 @@ class CBEngine(gym.Env):
         for cur in range(self.num_per_action):
             self.eng.next_step()
             self.now_step+=1
+
+
+
+
+            if((self.now_step +1)% self.log_interval == 0 and self.ui_enable==1):
+                self.eng.log_info(os.path.join(self.log_path,'time{}.json'.format(self.now_step//self.log_interval)))
+
             if((self.now_step+1) % self.log_interval ==0 and self.log_enable == 1):
                 # replay file
-                self.eng.log_info(os.path.join(self.log_path,'time{}.json'.format(self.now_step//self.log_interval)))
                 # vehicle info file
+                vlist = self.eng.get_vehicles()
+                for vehicle in vlist:
+                    if(vehicle not in self.vehicles.keys()):
+                        self.vehicles[vehicle] = {}
+                    for k,v in self.eng.get_vehicle_info(vehicle).items():
+                        self.vehicles[vehicle][k] = v
+                        self.vehicles[vehicle]['step'] = [self.now_step]
+            if((self.now_step + 1) % self.metric_period == 0 and self.log_enable == 1):
                 with open(os.path.join(self.log_path,'info_step {}.log'.format(self.now_step)),'w+') as f:
                     f.write("{}\n".format(self.eng.get_vehicle_count()))
-                    for vehicle in self.eng.get_vehicles():
+                    for vehicle in self.vehicles.keys():
+                        # if(self.vehicles[vehicle]['step'][0] <= self.now_step - self.metric_period):
+                        #     continue
                         f.write("for vehicle {}\n".format(vehicle))
-                        for k,v in self.eng.get_vehicle_info(vehicle).items():
+                        for k,v in self.vehicles[vehicle].items():
                             # f.write("{}:{}\n".format(k,v))
-                            f.write("{} :".format(k))
-                            for val in v:
-                                f.write(" {}".format(val))
-                            f.write("\n")
+                            if(k != 'step'):
+                                f.write("{} :".format(k))
+                                for val in v:
+                                    f.write(" {}".format(val))
+                                f.write("\n")
+                        f.write('step :')
+                        for val in self.vehicles[vehicle]['step']:
+                            f.write(" {}".format(val))
+                        f.write("\n")
                         f.write("-----------------\n")
+            # if((self.now_step+1) % self.log_interval ==0 and self.log_enable == 1):
+            # # replay file
+            # self.eng.log_info(os.path.join(self.log_path,'time{}.json'.format(self.now_step//self.log_interval)))
+            # # vehicle info file
+            # with open(os.path.join(self.log_path,'info_step {}.log'.format(self.now_step)),'w+') as f:
+            #     f.write("{}\n".format(self.eng.get_vehicle_count()))
+            #     for vehicle in self.eng.get_vehicles():
+            #         f.write("for vehicle {}\n".format(vehicle))
+            #         for k,v in self.eng.get_vehicle_info(vehicle).items():
+            #             # f.write("{}:{}\n".format(k,v))
+            #             f.write("{} :".format(k))
+            #             for val in v:
+            #                 f.write(" {}".format(val))
+            #             f.write("\n")
+            #         f.write("-----------------\n")
+
         reward = self._get_reward()
         dones = self._get_dones()
         obs = self._get_observations()
@@ -177,14 +226,21 @@ class CBEngine(gym.Env):
         return obs, reward, dones , info
 
     def reset(self):
+        del self.eng
+        gc.collect()
         self.eng = citypb.Engine(self.simulator_cfg_file, self.thread_num)
         self.now_step = 0
+        self.vehicles.clear()
         return self._get_observations(),self._get_info()
     def _get_info(self):
         info = {}
-        for vehicle in self.eng.get_vehicles():
-            info[vehicle] = self.eng.get_vehicle_info(vehicle)
-        return info
+        if(self.info_enable == 0):
+            return info
+        else:
+            v_list = self.eng.get_vehicles()
+            for vehicle in v_list:
+                info[vehicle] = self.eng.get_vehicle_info(vehicle)
+            return info
     def _get_reward(self):
 
         def get_diff(pre,sub):
