@@ -1,3 +1,5 @@
+import datetime
+
 import CBEngine
 import json
 import traceback
@@ -77,7 +79,7 @@ def load_agent_submission(submission_dir: Path):
 
     # This will fail w/ an import error of the submissions directory does not exist
     import gym_cfg as gym_cfg_submission
-    import agent as agent_submission
+    import agent_DQN as agent_submission
 
     gym_cfg_instance = gym_cfg_submission.gym_cfg()
 
@@ -275,6 +277,149 @@ def process_score(log_path,roads,step,scores_dir):
             json.dump(result_write,f_out,indent= 2)
 
     return result_write['data']['total_served_vehicles'],result_write['data']['delay_index']
+
+
+def train(agent_spec, simulator_cfg_file, gym_cfg, metric_period):
+    logger.info("\n")
+    logger.info("*" * 40)
+
+    gym_configs = gym_cfg.cfg
+    simulator_configs = read_config(simulator_cfg_file)
+    env = gym.make(
+        'CBEngine-v0',
+        simulator_cfg_file=simulator_cfg_file,
+        thread_num=1,
+        gym_dict=gym_configs,
+        metric_period=metric_period
+    )
+    scenario = [
+        'test'
+    ]
+
+    done = False
+
+    roadnet_path = Path(simulator_configs['road_file_addr'])
+
+    intersections, roads, agents = process_roadnet(roadnet_path)
+
+    observations, infos = env.reset()
+    agent_id_list = []
+    for k in observations:
+        agent_id_list.append(int(k.split('_')[0]))
+    agent_id_list = list(set(agent_id_list))
+    agent = agent_spec[scenario[0]]
+    agent.load_agent_list(agent_id_list)
+    agent.load_roadnet(intersections,roads,agents)
+    # Here begins the code for training
+
+    total_decision_num = 0
+    env.set_log(0)
+    env.set_warning(0)
+    env.set_ui(0)
+    env.set_info(0)
+    # agent.load_model(args.save_dir, 199)
+
+    # The main loop
+    for e in range(args.episodes):
+        print("----------------------------------------------------{}/{}".format(e, args.episodes))
+        last_obs = env.reset()
+        episodes_rewards = {}
+        for agent_id in agent_id_list:
+            episodes_rewards[agent_id] = 0
+        episodes_decision_num = 0
+
+        # Begins one simulation.
+        i = 0
+        while i < args.steps:
+            if i % args.action_interval == 0:
+                if isinstance(last_obs, tuple):
+                    observations = last_obs[0]
+                else:
+                    observations = last_obs
+                actions = {}
+
+                # Get the state.
+
+                observations_for_agent = {}
+                for key, val in observations.items():
+                    observations_agent_id = int(key.split('_')[0])
+                    observations_feature = key.split('_')[1]
+                    if (observations_agent_id not in observations_for_agent.keys()):
+                        observations_for_agent[observations_agent_id] = {}
+                    val = val[1:]
+                    while len(val) < agent.ob_length:
+                        val.append(0)
+                    observations_for_agent[observations_agent_id][observations_feature] = val
+
+                # Get the action, note that we use act_() for training.
+                actions = agent.act_(observations_for_agent)
+
+                rewards_list = {}
+
+                actions_ = {}
+                for key in actions.keys():
+                    actions_[key] = actions[key] + 1
+
+                # We keep the same action for a certain time
+                for _ in range(args.action_interval):
+                    # print(i)
+                    i += 1
+
+                    # Interacts with the environment and get the reward.
+                    observations, rewards, dones, infos = env.step(actions_)
+                    for agent_id in agent_id_list:
+                        lane_vehicle = observations["{}_lane_vehicle_num".format(agent_id)]
+                        pressure = (np.sum(lane_vehicle[13: 25]) - np.sum(lane_vehicle[1: 13])) / args.action_interval
+                        if agent_id in rewards_list:
+                            rewards_list[agent_id] += pressure
+                        else:
+                            rewards_list[agent_id] = pressure
+
+
+                rewards = rewards_list
+                new_observations_for_agent = {}
+
+                # Get next state.
+
+                for key, val in observations.items():
+                    observations_agent_id = int(key.split('_')[0])
+                    observations_feature = key.split('_')[1]
+                    if (observations_agent_id not in new_observations_for_agent.keys()):
+                        new_observations_for_agent[observations_agent_id] = {}
+                    val = val[1:]
+                    while len(val) < agent.ob_length:
+                        val.append(0)
+                    new_observations_for_agent[observations_agent_id][observations_feature] = val
+
+                # Remember (state, action, reward, next_state) into memory buffer.
+                for agent_id in agent_id_list:
+                    agent.remember(observations_for_agent[agent_id]['lane'], actions[agent_id], rewards[agent_id],
+                                   new_observations_for_agent[agent_id]['lane'])
+                    episodes_rewards[agent_id] += rewards[agent_id]
+                episodes_decision_num += 1
+                total_decision_num += 1
+
+                last_obs = observations
+
+            # Update the network
+            if total_decision_num > agent.learning_start and total_decision_num % agent.update_model_freq == agent.update_model_freq - 1:
+                agent.replay()
+            if total_decision_num > agent.learning_start and total_decision_num % agent.update_target_model_freq == agent.update_target_model_freq - 1:
+                agent.update_target_network()
+            if all(dones.values()):
+                break
+        if e % args.save_rate == args.save_rate - 1:
+            if not os.path.exists(args.save_dir):
+                os.makedirs(args.save_dir)
+            agent.save_model(args.save_dir, e)
+        logger.info(
+            "episode:{}/{}, average travel time:{}".format(e, args.episodes, env.eng.get_average_travel_time()))
+        for agent_id in agent_id_list:
+            logger.info(
+                "agent:{}, mean_episode_reward:{}".format(agent_id,
+                                                          episodes_rewards[agent_id] / episodes_decision_num))
+
+
 def run_simulation(agent_spec, simulator_cfg_file, gym_cfg,metric_period,scores_dir,threshold):
     logger.info("\n")
     logger.info("*" * 40)
@@ -296,10 +441,10 @@ def run_simulation(agent_spec, simulator_cfg_file, gym_cfg,metric_period,scores_
     # read roadnet file, get data
     roadnet_path = Path(simulator_configs['road_file_addr'])
     intersections, roads, agents = process_roadnet(roadnet_path)
-    # env.set_warning(0)
-    # env.set_log(0)
-    # env.set_info(0)
-    # env.set_ui(0)
+    env.set_warning(1)
+    env.set_log(1)
+    env.set_info(1)
+    env.set_ui(1)
     # get agent instance
     observations, infos = env.reset()
     agent_id_list = []
@@ -414,8 +559,6 @@ def format_exception(grep_word):
     return exception_str
 
 if __name__ == "__main__":
-
-
     # arg parse
     parser = argparse.ArgumentParser(
         prog="evaluation",
@@ -458,6 +601,19 @@ if __name__ == "__main__":
         type=float
     )
 
+    parser.add_argument('--thread', type=int, default=8, help='number of threads')
+    parser.add_argument('--steps', type=int, default=360, help='number of steps')
+    parser.add_argument('--action_interval', type=int, default=2, help='how often agent make decisions')
+    parser.add_argument('--episodes', type=int, default=100, help='training episodes')
+
+    parser.add_argument('--save_model', action="store_true", default=False)
+    parser.add_argument('--load_model', action="store_true", default=False)
+    parser.add_argument("--save_rate", type=int, default=5,
+                        help="save model once every time this many episodes are completed")
+    parser.add_argument('--save_dir', type=str, default="model/dqn_warm_up",
+                        help='directory in which model should be saved')
+    parser.add_argument('--log_dir', type=str, default="cmd_log/dqn_warm_up", help='directory in which logs should be saved')
+
     # result to be written in out/result.json
     result = {
         "success": False,
@@ -481,16 +637,16 @@ if __name__ == "__main__":
     except Exception as e:
         msg = format_exception(e)
         result['error_msg'] = msg
-        json.dump(result,open(scores_dir / "scores.json",'w'),indent=2)
+        json.dump(result, open(scores_dir / "scores.json", 'w'), indent=2)
         raise AssertionError()
 
     # get agent and configuration of gym
     try:
-        agent_spec,gym_cfg = load_agent_submission(submission_dir)
+        agent_spec, gym_cfg = load_agent_submission(submission_dir)
     except Exception as e:
         msg = format_exception(e)
         result['error_msg'] = msg
-        json.dump(result,open(scores_dir / "scores.json",'w'),indent=2)
+        json.dump(result, open(scores_dir / "scores.json", 'w'), indent=2)
         raise AssertionError()
 
     logger.info(f"Loaded user agent instance={agent_spec}")
@@ -498,11 +654,12 @@ if __name__ == "__main__":
     # simulation
     start_time = time.time()
     try:
-        scores = run_simulation(agent_spec, simulator_cfg_file, gym_cfg,metric_period,scores_dir,threshold)
+        train(agent_spec, simulator_cfg_file, gym_cfg, metric_period)
+        scores = run_simulation(agent_spec, simulator_cfg_file, gym_cfg, metric_period, scores_dir, threshold)
     except Exception as e:
         msg = format_exception(e)
         result['error_msg'] = msg
-        json.dump(result,open(scores_dir / "scores.json",'w'),indent=2)
+        json.dump(result, open(scores_dir / "scores.json", 'w'), indent=2)
         raise AssertionError()
 
     # write result
@@ -514,7 +671,7 @@ if __name__ == "__main__":
     # cal time
     end_time = time.time()
 
-    logger.info(f"total evaluation cost {end_time-start_time} s")
+    logger.info(f"total evaluation cost {end_time - start_time} s")
 
     # write score
     logger.info("\n\n")
